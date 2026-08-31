@@ -19193,10 +19193,9 @@ impl Default for Config {
         // a `HOME` env override, before falling back to `UserDirs`. Calling
         // it here, instead of duplicating a `UserDirs`-only computation,
         // means a `Config::default()` constructed under an isolated test or
-        // deployment never resolves to the real machine's `~/.zeroclaw` in
-        // the first place -- see issue #10495, where this env-var-blind
-        // computation was one way an unloaded Config's save target could end
-        // up pointing at an operator's real, populated config.toml.
+        // deployment never resolves to the real machine's `~/.zeroclaw`, and
+        // so cannot become a save target pointing at an operator's populated
+        // config.toml.
         let zeroclaw_dir = default_config_dir().unwrap_or_else(|_| {
             let home =
                 UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
@@ -31392,12 +31391,12 @@ model = "primary-model"
         let _ = tokio::fs::remove_dir_all(temp_home).await;
     }
 
-    /// Regression test for issue #10495: `Config::default()` computed its
-    /// `config_path`/`data_dir` from `UserDirs::home_dir()` directly, ignoring
-    /// `ZEROCLAW_CONFIG_DIR` entirely -- unlike every other path-resolution
-    /// entry point in this file. A `Config::default()` built under a
-    /// `ZEROCLAW_CONFIG_DIR`-isolated test or deployment therefore still
-    /// resolved to the real machine's `~/.zeroclaw`.
+    /// `Config::default()` previously computed its `config_path`/`data_dir`
+    /// from `UserDirs::home_dir()` directly, ignoring `ZEROCLAW_CONFIG_DIR`
+    /// entirely -- unlike every other path-resolution entry point in this
+    /// file. A `Config::default()` built under a `ZEROCLAW_CONFIG_DIR`-isolated
+    /// test or deployment therefore still resolved to the real machine's
+    /// `~/.zeroclaw`.
     #[test]
     async fn default_config_honors_zeroclaw_config_dir() {
         let _env_guard = env_override_lock().await;
