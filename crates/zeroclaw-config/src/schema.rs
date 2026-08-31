@@ -19188,9 +19188,22 @@ impl Default for SecurityOpsConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let home =
-            UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let zeroclaw_dir = home.join(".zeroclaw");
+        // `default_config_dir()` is the canonical resolution for "where does
+        // an unspecified config live": it honors `ZEROCLAW_CONFIG_DIR`, then
+        // a `HOME` env override, before falling back to `UserDirs`. Calling
+        // it here (instead of duplicating a `UserDirs`-only computation)
+        // means a `Config::default()` constructed under an isolated test or
+        // deployment (`ZEROCLAW_CONFIG_DIR` set) never resolves to the real
+        // machine's `~/.zeroclaw` in the first place -- see
+        // https://github.com/zeroclaw-labs/zeroclaw/issues/10495, where this
+        // duplicated, env-var-blind computation was one of two ways an
+        // unloaded Config's save target could end up pointing at an
+        // operator's real, populated config.toml.
+        let zeroclaw_dir = default_config_dir().unwrap_or_else(|_| {
+            let home =
+                UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
+            home.join(".zeroclaw")
+        });
 
         Self {
             data_dir: zeroclaw_dir.join("data"),
@@ -23277,6 +23290,36 @@ impl Config {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"));
         let resolved = zeroclaw_dir.join(file_name);
+
+        // A Config whose `config_path` has no parent has never been loaded
+        // from a specific file (see the early return above): it is either a
+        // fresh default or one constructed with a bare filename. Under test,
+        // reaching here with no ZEROCLAW_CONFIG_DIR/ZEROCLAW_DATA_DIR/
+        // ZEROCLAW_WORKSPACE set means resolution falls through to the REAL
+        // default config directory on whatever machine the test happens to
+        // run on -- this is the exact mechanism behind a real incident where
+        // a workspace test run silently replaced an operator's 109 KB
+        // config.toml with a 702-byte near-empty file (see
+        // https://github.com/zeroclaw-labs/zeroclaw/issues/10495). Refuse
+        // outright rather than repeat that. A test whose actual subject is
+        // this default-path resolution itself can opt in explicitly via
+        // `allow_default_config_dir_save_for_test`.
+        #[cfg(any(test, feature = "test-helpers"))]
+        if source == ConfigResolutionSource::DefaultConfigDir
+            && !default_config_dir_save_allowed_for_test()
+        {
+            panic!(
+                "resolve_config_path_for_save would resolve to the real default \
+                 config directory ({}) with no ZEROCLAW_CONFIG_DIR, \
+                 ZEROCLAW_DATA_DIR, or ZEROCLAW_WORKSPACE set. This test is not \
+                 isolated from a real install on this machine -- set one of \
+                 those env vars (most tests should), or call \
+                 allow_default_config_dir_save_for_test() first if this test's \
+                 subject is genuinely the default-path resolution itself.",
+                zeroclaw_dir.display()
+            );
+        }
+
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": self.config_path.display().to_string(), "resolved": resolved.display().to_string(), "source": source.as_str()})), "Config path missing parent directory; resolving from runtime environment");
         Ok(resolved)
     }
@@ -23475,6 +23518,39 @@ fn restore_onepassword_references_for_save(
         }
     }
     Ok(())
+}
+
+/// Test-only guard: whether the current test has explicitly opted in to
+/// `resolve_config_path_for_save` resolving to the real default config
+/// directory. Unreachable from production builds, for the same reason as
+/// `FAIL_POST_REPLACE_SYNC_FOR_PATHS` below.
+#[cfg(any(test, feature = "test-helpers"))]
+static ALLOW_DEFAULT_CONFIG_DIR_SAVE_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn default_config_dir_save_allowed_for_test() -> bool {
+    ALLOW_DEFAULT_CONFIG_DIR_SAVE_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Opt a test in to `resolve_config_path_for_save` resolving to the real
+/// default config directory, for a test whose actual subject is that
+/// resolution path itself. Returns a guard that clears the opt-in on drop.
+/// Callers must already hold `env_override_lock()` for the duration, the
+/// same as any other test that reads or writes the env vars this resolution
+/// depends on.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn allow_default_config_dir_save_for_test() -> impl Drop {
+    ALLOW_DEFAULT_CONFIG_DIR_SAVE_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ALLOW_DEFAULT_CONFIG_DIR_SAVE_FOR_TEST
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    Guard
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31379,6 +31455,51 @@ model = "primary-model"
             unsafe { std::env::remove_var("HOME") };
         }
         let _ = tokio::fs::remove_dir_all(temp_home).await;
+    }
+
+    /// Regression test for https://github.com/zeroclaw-labs/zeroclaw/issues/10495:
+    /// `Config::default()` used to compute its `config_path`/`data_dir` from
+    /// `UserDirs::home_dir()` directly, ignoring `ZEROCLAW_CONFIG_DIR`
+    /// entirely -- unlike every other path-resolution entry point in this
+    /// file. A `Config::default()` built under a `ZEROCLAW_CONFIG_DIR`-isolated
+    /// test or deployment therefore still resolved to the real machine's
+    /// `~/.zeroclaw`, one of the two ways an unloaded Config's save target
+    /// could land on an operator's real config.toml.
+    #[test]
+    async fn default_config_honors_zeroclaw_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let custom_dir =
+            std::env::temp_dir().join(format!("zeroclaw_test_custom_{}", uuid::Uuid::new_v4()));
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", &custom_dir);
+
+        let config = Config::default();
+
+        assert_eq!(config.config_path, custom_dir.join("config.toml"));
+        assert_eq!(config.data_dir, custom_dir.join("data"));
+    }
+
+    /// Companion regression test for the same issue: `resolve_config_path_for_save`
+    /// must not silently fall through to the real default config directory
+    /// under test when none of `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, or
+    /// `ZEROCLAW_WORKSPACE` isolate it -- this is the exact mechanism behind
+    /// the workspace test run that replaced an operator's 109 KB config.toml
+    /// with a 702-byte near-empty file.
+    #[test]
+    #[should_panic(expected = "resolve_config_path_for_save would resolve to the real default")]
+    async fn resolve_config_path_for_save_refuses_unisolated_default_under_test() {
+        let _env_guard = env_override_lock().await;
+        let _config_guard = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _ws_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        // A bare, parent-less config_path is what actually reaches the
+        // fallback branch this guard protects.
+        let config = Config {
+            config_path: PathBuf::from("config.toml"),
+            ..Config::default()
+        };
+
+        let _ = config.resolve_config_path_for_save().await;
     }
 
     #[test]
